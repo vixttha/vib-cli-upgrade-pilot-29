@@ -1,0 +1,128 @@
+name: VIB direct CLI upgrade pilot
+on:
+  push:
+    branches:
+      - ops/vib-phase4-cli-pilot
+permissions:
+  contents: write
+jobs:
+  lifecycle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: vixttha/Version-Issues-Hub
+          ref: 26e9fe8c019a33c5f84f77a37da70925505204e3
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: '3.12'
+      - name: Exercise direct CLI install, upgrade and archival
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          from tools import install, session
+          
+          pilot = "vixttha/vib-cli-upgrade-pilot-29"
+          pilot_id = 1472437705
+          product_sha = "d013d61b48d1dd1ccba82b1d0e9346660dd7e1ca"
+          old_source = "c79217ea4c18d892cd49112bc30b7b28a2fb502b"
+          new_source = "26e9fe8c019a33c5f84f77a37da70925505204e3"
+          report_path = Path(os.environ["RUNNER_TEMP"]) / "lifecycle-receipt.json"
+          report = {
+              "issue": 29, "repository": pilot, "repository_id": pilot_id,
+              "workflow_sha": os.environ["GITHUB_SHA"], "run_id": os.environ["GITHUB_RUN_ID"],
+              "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"], "transport": "direct-python-cli",
+              "old_source": old_source, "new_source": new_source, "steps": {},
+          }
+          def record(name, value):
+              report["steps"][name] = value
+              report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+          
+          def cli(name, module, args, expected=0, error=None):
+              command = [sys.executable, "-m", module, "--target", pilot, *args]
+              result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8")
+              detail = {"exit": result.returncode}
+              if result.returncode == 0:
+                  detail["result"] = json.loads(result.stdout)
+              else:
+                  detail["diagnostic"] = result.stderr.strip()
+                  print(f"{name}: {detail['diagnostic']}", file=sys.stderr)
+              record(name, detail)
+              if result.returncode != expected or (error and error not in result.stderr):
+                  raise RuntimeError(f"{name} did not satisfy its expected outcome")
+              return detail.get("result")
+          
+          if (os.environ["GITHUB_REPOSITORY"] != pilot or
+                  int(os.environ["GITHUB_REPOSITORY_ID"]) != pilot_id or
+                  os.environ["GITHUB_REF"] != "refs/heads/ops/vib-phase4-cli-pilot"):
+              raise RuntimeError("Pilot repository, identity or workflow ref does not match")
+          api = install.GitHub(os.environ["GH_TOKEN"])
+          prefix = install.repo_path(pilot)
+          meta = api.request("GET", prefix)
+          if (meta["id"] != pilot_id or meta["full_name"] != pilot or meta["private"] is not False
+                  or meta["default_branch"] != "main"
+                  or install.read_ref(api, prefix, "main") != product_sha
+                  or install.read_ref(api, prefix, install.BRANCH) is not None):
+              raise RuntimeError("Pilot must be the original public target with an empty dedicated branch")
+          record("initial_identity", {"id": pilot_id, "public": True, "product_sha": product_sha})
+          
+          install_args = ["--source-sha", old_source, "--baseline", "v0.0.0"]
+          cli("install_dry_run", "tools.install", install_args)
+          old_state = cli("install_apply", "tools.install", [*install_args, "--apply"])["installed_sha"]
+          cli("duplicate_install_refused", "tools.install", [*install_args, "--apply"], expected=1, error="already exists")
+          if install.read_ref(api, prefix, "main") != product_sha:
+              raise RuntimeError("Product ref unexpectedly changed after installation")
+          
+          old_blobs = {path: install.read_text(api, prefix, path, old_state)
+                       for path in (session.LEDGER, session.HANDOFF)}
+          if json.loads(old_blobs[session.LEDGER])["issues"] or json.loads(old_blobs[session.HANDOFF])["active"] is not None:
+              raise RuntimeError("Pilot state must start empty")
+          upgrade = ["--expected-sha", old_state, "upgrade", "--source-sha", new_source]
+          cli("upgrade_dry_run", "tools.lifecycle", upgrade)
+          result = cli("direct_upgrade_apply", "tools.lifecycle", [*upgrade, "--apply", "--owner-approved"])
+          if result["status"] != "upgraded":
+              raise RuntimeError("Direct CLI upgrade did not publish the installed ref")
+          new_state = result["installed_sha"]
+          cli("stale_upgrade_refused", "tools.lifecycle", [*upgrade, "--apply", "--owner-approved"], expected=1, error="advanced")
+          archived = cli("archive_apply", "tools.lifecycle",
+                         ["--expected-sha", new_state, "prepare-retirement", "--apply", "--owner-approved"])
+          fresh = cli("fresh_inspect", "tools.session", ["--expected-sha", new_state, "inspect"])
+          
+          new_blobs = {path: install.read_text(api, prefix, path, new_state) for path in old_blobs}
+          commit = api.request("GET", prefix + "/git/commits/" + new_state)
+          archive_sha = install.read_ref(api, prefix, archived["archive_branch"])
+          verified = (
+              install.read_ref(api, prefix, "main") == product_sha
+              and install.read_ref(api, prefix, install.BRANCH) == new_state
+              and archive_sha == new_state
+              and [p["sha"] for p in commit["parents"]] == [old_state]
+              and new_blobs == old_blobs
+              and fresh["active"] is None
+              and json.loads(install.read_text(api, prefix, "vib-install.json", new_state))["source_sha"] == new_source
+          )
+          record("final_verification", {
+              "passed": verified, "old_installed_sha": old_state, "installed_sha": new_state,
+              "tree_sha": commit["tree"]["sha"], "archive_sha": archive_sha,
+              "product_sha": install.read_ref(api, prefix, "main"),
+              "preserved_state_sha256": {path: hashlib.sha256(data.encode()).hexdigest() for path,data in new_blobs.items()},
+          })
+          if not verified:
+              raise RuntimeError("Direct upgrade readback did not satisfy the pilot contract")
+          print("Direct CLI upgrade and archive verified on the isolated public runner.")
+          PY
+      - name: Retain lifecycle evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: vib-29-direct-cli-lifecycle
+          path: ${{ runner.temp }}/lifecycle-receipt.json
+          if-no-files-found: warn
