@@ -61,15 +61,18 @@ def validate_policy(policy):
 
 def exact_collection(api, path, key):
     value = api.request("GET", path)
-    rows = value[key]
-    if not isinstance(rows, list) or value.get("total_count") != len(rows):
+    if not isinstance(value, dict):
+        raise ValueError("Invalid GitHub collection; gate fails closed")
+    rows = value.get(key)
+    count = value.get("total_count")
+    if type(count) is not int or count < 0 or not isinstance(rows, list) or count != len(rows):
         raise ValueError("Incomplete GitHub collection; gate fails closed")
     return rows
 
 def assert_current_pr(api, prefix, policy):
     pr = api.request("GET", prefix + "/pulls/" + str(policy["pull_request"]))
     if (pr.get("number") != policy["pull_request"] or pr.get("state") != "open"
-            or pr.get("merged") is True or pr["base"]["ref"] != policy["product_branch"]
+            or pr.get("merged") is not False or pr["base"]["ref"] != policy["product_branch"]
             or pr["base"]["repo"]["id"] != policy["repository_id"]
             or pr["head"]["repo"]["id"] != policy["repository_id"]
             or pr["head"]["sha"] != policy["head_sha"] or pr["base"]["sha"] != policy["base_sha"]
@@ -230,17 +233,42 @@ def publish(api, publisher, target, policy):
     # Re-evaluate after creating the pending check. The trusted executor must
     # serialize publication, revocation, and policy/state writes through merge.
     verdict = evaluate(api, target, policy)
-    updated = publisher.request("PATCH", path, {
-        "status": "completed", "conclusion": "success",
-        "output": {"title": "VIB gate passed", "summary":
-            f"Owner-pinned state {policy['installed_sha']}; tested merge {policy['merge_sha']}; "
-            f"{len(verdict['issues'])} staged issue(s)."},
-    })
-    for check in (updated, api.request("GET", path)):
-        assert_gate_identity(check, policy, expected_id=check_id)
-        if check.get("status") != "completed" or check.get("conclusion") != "success":
-            raise ValueError("Gate success was not confirmed")
+    # Once success publication is attempted, even a transport failure may mean
+    # GitHub accepted it. Never retry that success write. Confirm exact evidence
+    # again and invalidate the same check if confirmation fails.
+    try:
+        updated = publisher.request("PATCH", path, {
+            "status": "completed", "conclusion": "success",
+            "output": {"title": "VIB gate passed", "summary":
+                f"Owner-pinned state {policy['installed_sha']}; tested merge {policy['merge_sha']}; "
+                f"{len(verdict['issues'])} staged issue(s)."},
+        })
+        for check in (updated, api.request("GET", path)):
+            assert_gate_identity(check, policy, expected_id=check_id)
+            if check.get("status") != "completed" or check.get("conclusion") != "success":
+                raise ValueError("Gate success was not confirmed")
+        confirmed = evaluate(api, target, policy)
+        if confirmed != verdict:
+            raise ValueError("Bound evidence changed during publication")
+        rows = matching_gate_checks(api, prefix, policy)
+        if len(rows) != 1 or rows[0].get("id") != check_id:
+            raise ValueError("Ambiguous trusted gate check after publication")
+        assert_gate_identity(rows[0], policy, expected_id=check_id)
+        if rows[0].get("status") != "completed" or rows[0].get("conclusion") != "success":
+            raise ValueError("Published gate changed during confirmation")
+    except Exception as exc:
+        # Revocation independently verifies the original check identity.
+        # An unsuccessful or ambiguous revocation requires owner intervention.
+        try:
+            revoke(api, publisher, target, policy, check_id)
+        except Exception as revoke_error:
+            raise ValueError(
+                f"Gate publication uncertain; FREEZE MERGES; revocation of check {check_id} "
+                "not confirmed. Inspect original policy and check; do not retry publication."
+            ) from revoke_error
+        raise ValueError(f"Gate publication invalidated; check {check_id} revoked: {exc}") from exc
     return {**verdict, "published": True, "check_id": check_id}
+
 
 def revoke(api, publisher, target, policy, check_id):
     """Revoke an exact previously published verdict, including an old state pin."""

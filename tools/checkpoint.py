@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -27,8 +28,20 @@ def unique_keys(pairs):
     return result
 
 
+def reject_constant(_value):
+    raise ValueError("Nonfinite JSON number")
+
+
+def finite_float(raw):
+    value = float(raw)
+    if not math.isfinite(value):
+        raise ValueError("Nonfinite JSON number")
+    return value
+
+
 def parse_json(raw):
-    return json.loads(raw, object_pairs_hook=unique_keys)
+    return json.loads(raw, object_pairs_hook=unique_keys,
+                      parse_constant=reject_constant, parse_float=finite_float)
 
 
 def require(pattern, value, label):
@@ -79,9 +92,13 @@ def check_history(ledger, previous):
     before = bindings(previous)
     if ledger["repository"].lower() != previous["repository"].lower():
         raise ValueError("Ledger repository changed")
+    current_criteria = {row["issue"]: row["acceptance"] for row in ledger["issues"]}
+    previous_criteria = {row["issue"]: row["acceptance"] for row in previous["issues"]}
     for issue, version in before.items():
         if current.get(issue) != version:
             raise ValueError(f"Historical assignment changed: issue #{issue} was {version}")
+        if current_criteria[issue] != previous_criteria[issue]:
+            raise ValueError(f"Historical acceptance criteria changed: issue #{issue}")
 
 
 def register(ledger, issue, line, criteria):
@@ -212,19 +229,26 @@ def receipt(ledger, version, checkout, env, event, parents=(), *, fix_sha):
 
 
 def write_json(path, data):
+    encoded = json.dumps(data, indent=2, allow_nan=False) + "\n"
     with TemporaryDirectory(dir=path.parent) as temporary:
         staged = Path(temporary) / path.name
-        staged.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8", newline="\n")
+        staged.write_text(encoded, encoding="utf-8", newline="\n")
         staged.replace(path)
 
 
 def receipts(ledger, scope, checkout, env, event, parents=(), *, versions=None, previous=None):
     check_receipt_scope(ledger, scope, previous)
-    records = []
-    for version in scope["versions"] if versions is None else versions:
+    selected = scope["versions"] if versions is None else versions
+    if not isinstance(selected, (list, tuple)) or not selected:
+        raise ValueError("Receipt selection needs at least one version")
+    for version in selected:
         require(VERSION, version, "issue version")
         if version not in scope["fixes"]:
             raise ValueError(f"No fix revision for {version}")
+    if len(set(selected)) != len(selected):
+        raise ValueError("Receipt selection contains duplicate versions")
+    records = []
+    for version in selected:
         record = receipt(ledger, version, checkout, env, event, parents,
                          fix_sha=scope["fixes"][version])
         verify_fix_ancestry(version, record["fix_sha"], record["candidate_sha"])

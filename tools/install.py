@@ -7,9 +7,15 @@ import json
 import os
 import re
 import sys
-from urllib.error import HTTPError
+import time
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, build_opener, HTTPRedirectHandler
+
+if __package__:
+    from . import checkpoint
+else:  # Preserve direct script invocation.
+    import checkpoint
 
 SOURCE = "vixttha/Version-Issues-Hub"
 BRANCH = "Version-Issues-Hub"
@@ -24,15 +30,46 @@ PACKAGE = {
     "tools/session.py": "tools/session.py",
     "tools/gate.py": "tools/gate.py",
     "tools/standard.py": "tools/standard.py",
+    "tools/lifecycle.py": "tools/lifecycle.py",
+    "install/branch/LIFECYCLE.md": "LIFECYCLE.md",
     "install/branch/STANDARD.md": "STANDARD.md",
     "install/branch/GATE.md": "GATE.md",
     "install/branch/AGENTS.md": "AGENTS.md",
+    "LICENSE": "VIB-LICENSE.md",
+    "VIB-NOTICE.md": "VIB-NOTICE.md",
+}
+
+HISTORICAL_LEGAL_PATHS = {
+    "docs/licensing/reference/PolyForm-Strict-1.0.0.md": "VIB-LICENSE.md",
+    "docs/licensing/VIB-NOTICE-REVIEW.md": "VIB-NOTICE.md",
 }
 
 class ApiError(RuntimeError):
-    def __init__(self, status):
-        super().__init__(f"GitHub API returned HTTP {status}")
+    def __init__(self, status, method=None, operation=None):
+        context = f" ({method} {operation})" if method and operation else ""
+        super().__init__(f"GitHub API returned HTTP {status}{context}")
         self.status = status
+
+class ApiTransportError(OSError):
+    """Transport failure with only safe operation context, never request details."""
+    def __init__(self, method, operation, timed_out):
+        self.timed_out = timed_out
+        detail = "timed out" if timed_out else "failed"
+        caution = "; inspect before retrying any write" if method != "GET" else ""
+        super().__init__(f"GitHub transport {detail} ({method} {operation}){caution}")
+
+
+def api_operation(path):
+    """Classify endpoint without logging repository names, filenames, query strings or bodies."""
+    parts = path.split("?", 1)[0].split("/")
+    tail = parts[4:] if len(parts) >= 4 and parts[1] == "repos" else []
+    if not tail:
+        return "repository"
+    if tail[0] == "git" and len(tail) >= 2 and tail[1] in ("trees", "commits", "refs", "ref", "blobs"):
+        return "git/" + tail[1]
+    if tail[0] in ("compare", "contents", "issues", "pulls", "actions", "check-runs", "commits"):
+        return tail[0]
+    return "other"
 
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -47,15 +84,34 @@ class GitHub:
         headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
         if self.token:
             headers["Authorization"] = "Bearer " + self.token
-        data = None if body is None else json.dumps(body).encode()
+        data = None if body is None else json.dumps(body, allow_nan=False).encode()
         if data is not None:
             headers["Content-Type"] = "application/json"
         req = Request("https://api.github.com" + path, data=data, headers=headers, method=method)
-        try:
-            with self.opener.open(req, timeout=30) as response:
-                return json.load(response)
-        except HTTPError as exc:
-            raise ApiError(exc.code) from None
+        delays = (0, 0.5, 1.5) if method == "GET" else (0,)
+        for attempt, delay in enumerate(delays):
+            if delay:
+                time.sleep(delay)
+            try:
+                with self.opener.open(req, timeout=30) as response:
+                    try:
+                        return checkpoint.parse_json(response.read().decode("utf-8"))
+                    except ValueError:
+                        # A malformed write response is uncertain; never replay the write.
+                        caution = "; inspect before retrying any write" if method != "GET" else ""
+                        raise ValueError(f"Invalid GitHub JSON response ({method} {api_operation(path)}){caution}") from None
+            except HTTPError as exc:
+                code = exc.code
+                exc.close()
+                if code not in (500, 502, 503, 504) or attempt == len(delays) - 1:
+                    raise ApiError(code, method, api_operation(path)) from None
+            except (TimeoutError, URLError) as exc:
+                timed_out = isinstance(exc, TimeoutError) or (
+                    isinstance(exc, URLError) and isinstance(exc.reason, TimeoutError))
+                # A read may safely repeat; an uncertain write never does.
+                if not timed_out or attempt == len(delays) - 1:
+                    raise ApiTransportError(method, api_operation(path), timed_out) from None
+
 
 def require(pattern, value, name):
     if not isinstance(value, str) or not pattern.fullmatch(value):
@@ -78,6 +134,21 @@ def read_ref(api, prefix, branch):
     if data.get("ref") != "refs/heads/" + branch or data["object"]["type"] != "commit":
         raise ValueError("Unexpected GitHub ref response")
     return require(SHA, data["object"]["sha"], "ref revision")
+
+def wait_ref(api, prefix, branch, expected, previous=None):
+    """After a successful write, tolerate only absent/known-old readback, never repeat the write."""
+    require(SHA, expected, "expected ref revision")
+    if previous is not None:
+        require(SHA, previous, "previous ref revision")
+    for delay in (0, 0.25, 0.5, 1, 2, 4):
+        if delay:
+            time.sleep(delay)
+        observed = read_ref(api, prefix, branch)
+        if observed == expected:
+            return expected
+        if observed != previous:
+            raise ValueError("Unexpected ref revision after write; inspect before retrying")
+    raise ValueError("Ref readback not confirmed; inspect before retrying")
 
 def read_text(api, prefix, path, ref):
     require(SHA, ref, "file revision")
@@ -108,7 +179,7 @@ def pinned_package(source_text):
         raise ValueError("Invalid pinned package declaration") from exc
     required = {"install/branch/README.md", "install/branch/WORKFLOW.md", "tools/checkpoint.py"}
     if (not required.issubset(package) or
-            any(not isinstance(k, str) or not isinstance(v, str) or PACKAGE.get(k) != v
+            any(not isinstance(k, str) or not isinstance(v, str) or {**PACKAGE, **HISTORICAL_LEGAL_PATHS}.get(k) != v
                 for k, v in package.items()) or len(set(package.values())) != len(package)):
         raise ValueError("Pinned package has unsupported or missing paths")
     return package
@@ -125,7 +196,26 @@ def source_files(api, source_sha):
     return files
 
 def render(data):
-    return json.dumps(data, indent=2, sort_keys=True) + "\n"
+    return json.dumps(data, indent=2, sort_keys=True, allow_nan=False) + "\n"
+
+def require_publishable_package(files):
+    """Reject incomplete or review-only legal packages; not a license enforcement service."""
+    names = {"VIB-LICENSE.md", "VIB-NOTICE.md"}
+    if not names.intersection(files):
+        return  # Historical pins remain readable and compatible.
+    if not names.issubset(files):
+        raise ValueError("Incomplete legal package is not authorized for installation or upgrade")
+    raw = files["VIB-LICENSE.md"].encode("utf-8")
+    blob = hashlib.sha1(b"blob " + str(len(raw)).encode() + b"\0" + raw).hexdigest()
+    notice = files["VIB-NOTICE.md"]
+    notice_raw = notice.encode("utf-8")
+    notice_blob = hashlib.sha1(b"blob " + str(len(notice_raw)).encode() + b"\0" + notice_raw).hexdigest()
+    if (blob != "90abd0e6c64a135f42451762337a397bf27f4862"
+            or notice_blob != "70dd8710828a38118965be3ca8be32457d106789"
+            or "VIB_LICENSE_TERMS_APPROVED" not in notice.splitlines()
+            or "REVIEW_ONLY_NOT_A_GRANT" in notice):
+        raise ValueError("Legal review package is not authorized for installation or upgrade")
+
 
 def install(api, target, source_sha, baseline, apply=False):
     require(SHA, source_sha, "full source commit")
@@ -166,6 +256,7 @@ def install(api, target, source_sha, baseline, apply=False):
     plan = {"status": "planned", "manifest": manifest, "paths": sorted(files)}
     if not apply:
         return plan
+    require_publishable_package(files)
     # Recheck identity and refs before creating unreachable objects. Never update a ref.
     latest = api.request("GET", prefix)
     if latest.get("id") != meta["id"] or latest.get("default_branch") != default:
@@ -181,8 +272,7 @@ def install(api, target, source_sha, baseline, apply=False):
     })["sha"], "installed commit")
     # Create-only: GitHub rejects an existing branch even in a race.
     api.request("POST", prefix + "/git/refs", {"ref": "refs/heads/" + BRANCH, "sha": commit})
-    if read_ref(api, prefix, BRANCH) != commit:
-        raise ValueError("Install ref read-back mismatch; inspect before retrying")
+    wait_ref(api, prefix, BRANCH, commit)
     installed = api.request("GET", prefix + "/git/commits/" + commit)
     if installed.get("sha") != commit or installed["tree"]["sha"] != tree:
         raise ValueError("Installed tree read-back mismatch")

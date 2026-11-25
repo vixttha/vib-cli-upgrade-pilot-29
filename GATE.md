@@ -44,3 +44,7 @@ python -m tools.gate --target OWNER/REPO --policy /trusted/original-policy.json 
 ```
 
 The revocation command verifies repository identity and the original external ID, updates that exact trusted check to failure, and reads it back. It intentionally works after the installed state changes, as emergency remediation. This does not prove live GitHub re-evaluation; include a post-green revocation negative control in the disposable pilot. No live merge enforcement may be advertised until that control passes.
+
+### Post-publication evidence confirmation (#34)
+
+After attempting the success PATCH, the publisher re-evaluates the complete policy and compares the exact proof identities (including check ID, run/attempt and job ID) to the pre-publication result, then confirms the unique published check. On changed evidence, failed readback or uncertain success response it attempts identity-checked revocation of the same check; it never retries the success PATCH. An unconfirmed revocation requires an immediate merge freeze and owner investigation. These are bounded observations, not atomic enforcement: GitHub may expose green before revocation or evidence may change after the last read. The trusted executor must serialize reruns, test-attestation updates, policy/state writes, publication, revocation and merge decisions; the disposable live negative control remains mandatory. Standard remains independent and enforcement disabled by default.

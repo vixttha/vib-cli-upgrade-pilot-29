@@ -61,11 +61,14 @@ def validate_handoff(handoff, ledger):
         raise ValueError("Invalid handoff schema")
     if type(handoff["schema_version"]) is not int or handoff["schema_version"] != 1 or not isinstance(handoff["history"], list):
         raise ValueError("Invalid handoff version or history")
+    checkpoint.bindings(ledger)
+    in_progress = {row["issue"] for row in ledger["issues"] if row["state"] == "in_progress"}
     if handoff["active"] is not None:
         validate_active(handoff["active"], ledger)
-        row = next(x for x in ledger["issues"] if x["issue"] == handoff["active"]["issue"])
-        if row["state"] != "in_progress":
-            raise ValueError("Active issue must be in progress")
+        if in_progress != {handoff["active"]["issue"]}:
+            raise ValueError("Active issue must be the sole in-progress row; owner reconciliation required")
+    elif in_progress:
+        raise ValueError("Orphan in-progress issue without active handoff; owner reconciliation required")
     for record in handoff["history"]:
         if not isinstance(record, dict) or set(record) != {"handoff", "disposition", "decision", "merged_sha"}:
             raise ValueError("Invalid archived handoff")
@@ -73,6 +76,10 @@ def validate_handoff(handoff, ledger):
         if record["disposition"] not in ("blocked", "deferred", "staged", "integrated", "rework") or (record["disposition"] != "rework" and record["handoff"]["phase"] != "Head"):
             raise ValueError("Invalid archived disposition")
         text(record["decision"], "owner decision")
+        if record["disposition"] in ("staged", "integrated"):
+            archived = record["handoff"]
+            if any(archived[key] is None for key in ("fix_sha", "candidate_sha", "pull_request")) or not archived["evidence"]:
+                raise ValueError("Archived staged/integrated handoff requires a fix, candidate, PR and evidence")
         if record["disposition"] == "integrated":
             install.require(install.SHA, record["merged_sha"], "merged revision")
         elif record["merged_sha"] is not None:
@@ -136,6 +143,14 @@ def get_pr(api, state, active):
         raise ValueError("PR candidate or target changed; return to Worker and reverify")
     return pr
 
+def require_open_pr(api, state, active):
+    pr = get_pr(api, state, active)
+    if pr.get("merged") is True:
+        raise ValueError("PR is merged; return to Head for owner reconciliation")
+    if pr.get("state") != "open" or pr.get("merged") is not False:
+        raise ValueError("PR is not open and unmerged; return to Head or rework")
+    return pr
+
 def inspect(api, state, requested=None):
     active = state["handoff"]["active"]
     issue = requested if requested is not None else (active["issue"] if active else None)
@@ -147,17 +162,28 @@ def inspect(api, state, requested=None):
     status = "head_scope_required" if active is None else "resume"
     if active and issue != active["issue"]:
         status = "blocked_other_active_issue"
-    if active and active["pull_request"] is not None and status == "resume":
-        try:
-            get_pr(api, state, active)
-        except ValueError:
-            status = "stale_candidate"
+    if active and status == "resume":
+        if active["pull_request"] is not None:
+            try:
+                pr = get_pr(api, state, active)
+            except ValueError:
+                status = "stale_candidate"
+            else:
+                if pr.get("merged") is True and pr.get("state") == "closed":
+                    status = "merged_reconciliation_required"
+                elif pr.get("state") == "closed" and pr.get("merged") is False:
+                    status = "closed_pr_rework_required"
+                elif pr.get("state") != "open" or pr.get("merged") is not False:
+                    status = "pr_state_unverified"
+        if status == "resume" and info["state"] != "open":
+            status = "issue_reconciliation_required"
     return {"status": status, "installed_sha": state["ref"], "product_sha": state["product_sha"],
             "repository": state["ledger"]["repository"], "baseline": state["manifest"]["baseline_version"],
             "target": state["manifest"]["target_version"], "issue": info, "active": active,
             "owner_merge_required": True, "evidence_verified": False}
 
-def claim(api, state, number, criteria, note):
+def claim(api, state, number, criteria, note, *, resume_prior_line=False):
+    validate_handoff(state["handoff"], state["ledger"])
     item = get_issue(api, state, number)
     if item.get("state") != "open":
         raise ValueError("Only an open GitHub issue can be claimed")
@@ -171,10 +197,23 @@ def claim(api, state, number, criteria, note):
         if criteria and criteria != record["acceptance"]:
             raise ValueError("Existing acceptance criteria differ")
         return ledger, handoff
-    version, _ = checkpoint.register(ledger, number, state["manifest"]["baseline_version"], criteria)
-    row = next(x for x in ledger["issues"] if x["issue"] == number)
-    if row["state"] in ("integrated", "retired"):
+    baseline = state["manifest"]["baseline_version"]
+    row = next((x for x in ledger["issues"] if x["issue"] == number), None)
+    if row is not None and row["state"] in ("integrated", "retired"):
         raise ValueError("Historical issue cannot be reclaimed")
+    if row is not None and row["version"].rsplit(".", 1)[0] != baseline:
+        prior_line = row["version"].rsplit(".", 1)[0]
+        if (checkpoint.version_number(prior_line) >= checkpoint.version_number(baseline)
+                or row["state"] not in ("assigned", "blocked", "deferred")):
+            raise ValueError("Issue is not eligible for prior-line recovery; owner reconciliation required")
+        if not resume_prior_line:
+            raise ValueError("Prior-line issue requires explicit owner-approved --resume-prior-line")
+        version = row["version"]
+    else:
+        if resume_prior_line:
+            raise ValueError("Prior-line recovery requires an existing eligible historical issue")
+        version, _ = checkpoint.register(ledger, number, baseline, criteria)
+        row = next(x for x in ledger["issues"] if x["issue"] == number)
     if criteria and criteria != row["acceptance"]:
         raise ValueError("Existing acceptance criteria differ")
     row["state"] = "in_progress"
@@ -185,6 +224,7 @@ def claim(api, state, number, criteria, note):
 
 def advance(api, state, note, *, fix=None, candidate=None, pr=None, evidence=None,
             rework=False, return_to_head=False):
+    validate_handoff(state["handoff"], state["ledger"])
     ledger = copy.deepcopy(state["ledger"])
     handoff = copy.deepcopy(state["handoff"])
     active = handoff["active"]
@@ -197,6 +237,17 @@ def advance(api, state, note, *, fix=None, candidate=None, pr=None, evidence=Non
     if rework:
         if phase == "Worker":
             raise ValueError("Already in Worker phase")
+        if get_issue(api, state, active["issue"]).get("state") != "open":
+            raise ValueError("Issue is not open; return to Head for owner reconciliation")
+        if active["pull_request"] is not None:
+            # Rework is allowed for stale or closed-unmerged PRs, never for a
+            # merged PR (including a changed head) or an unverified PR state.
+            existing = api.request("GET", state["prefix"] + "/pulls/" +
+                                   str(issue_number(active["pull_request"])))
+            if (existing.get("number") != active["pull_request"]
+                    or existing.get("merged") is not False
+                    or existing.get("state") not in ("open", "closed")):
+                raise ValueError("PR is merged or state is unverified; return to Head for owner reconciliation")
         previous = copy.deepcopy(state["handoff"]["active"])
         handoff["history"].append({"handoff": previous, "disposition": "rework",
                                    "decision": note, "merged_sha": None})
@@ -205,15 +256,17 @@ def advance(api, state, note, *, fix=None, candidate=None, pr=None, evidence=Non
         if phase == "Head":
             raise ValueError("Already at Head")
         active["phase"] = "Head"
+    elif get_issue(api, state, active["issue"]).get("state") != "open":
+        raise ValueError("Issue is not open; return to Head for owner reconciliation")
     elif phase == "Worker":
         active.update(phase="Validate", fix_sha=fix, candidate_sha=candidate, pull_request=pr, evidence=[])
         validate_active(active, ledger)
-        get_pr(api, state, active)
+        require_open_pr(api, state, active)
     elif phase == "Validate":
-        get_pr(api, state, active)
+        require_open_pr(api, state, active)
         active.update(phase="Internal Auditor", evidence=evidence_links(ledger["repository"], evidence or []))
     elif phase == "Internal Auditor":
-        get_pr(api, state, active)
+        require_open_pr(api, state, active)
         active["phase"] = "Head"
     else:
         raise ValueError("Head must decide or return to Worker")
@@ -221,6 +274,7 @@ def advance(api, state, note, *, fix=None, candidate=None, pr=None, evidence=Non
     return ledger, handoff
 
 def finish(api, state, disposition, decision):
+    validate_handoff(state["handoff"], state["ledger"])
     ledger = copy.deepcopy(state["ledger"])
     handoff = copy.deepcopy(state["handoff"])
     active = handoff["active"]
@@ -234,11 +288,11 @@ def finish(api, state, disposition, decision):
             raise ValueError("Integration requires recorded verification evidence")
         pr = get_pr(api, state, active)
         if disposition == "staged":
-            if pr.get("state") != "open" or pr.get("merged") is True:
+            if pr.get("state") != "open" or pr.get("merged") is not False:
                 raise ValueError("Staging requires an open unmerged PR")
         else:
-            if pr.get("merged") is not True:
-                raise ValueError("GitHub does not report the PR merged")
+            if pr.get("state") != "closed" or pr.get("merged") is not True:
+                raise ValueError("GitHub does not report a closed, merged PR")
             merged = install.require(install.SHA, pr["merge_commit_sha"], "merged revision")
     handoff["history"].append({"handoff": active, "disposition": disposition,
                                "decision": text(decision, "owner decision"), "merged_sha": merged})
@@ -247,6 +301,7 @@ def finish(api, state, disposition, decision):
     return ledger, handoff
 
 def reconcile(api, state, number, decision):
+    validate_handoff(state["handoff"], state["ledger"])
     ledger = copy.deepcopy(state["ledger"])
     handoff = copy.deepcopy(state["handoff"])
     if handoff["active"] is not None:
@@ -259,8 +314,8 @@ def reconcile(api, state, number, decision):
         raise ValueError("Missing latest staged handoff")
     active = copy.deepcopy(prior["handoff"])
     pr = get_pr(api, state, active)
-    if pr.get("merged") is not True:
-        raise ValueError("GitHub does not report the PR merged")
+    if pr.get("state") != "closed" or pr.get("merged") is not True:
+        raise ValueError("GitHub does not report a closed, merged PR")
     handoff["history"].append({"handoff": active, "disposition": "integrated",
         "decision": text(decision, "owner decision"), "merged_sha": install.require(
             install.SHA, pr["merge_commit_sha"], "merged revision")})
@@ -268,6 +323,7 @@ def reconcile(api, state, number, decision):
     return ledger, handoff
 
 def save(api, state, ledger, handoff, apply=False):
+    validate_handoff(state["handoff"], state["ledger"])
     checkpoint.check_history(ledger, state["ledger"])
     validate_handoff(handoff, ledger)
     if handoff["history"][:len(state["handoff"]["history"])] != state["handoff"]["history"]:
@@ -292,8 +348,7 @@ def save(api, state, ledger, handoff, apply=False):
     install.require(install.SHA, new, "handoff commit")
     # Fast-forward-only CAS: a divergent writer cannot overwrite a competing handoff.
     api.request("PATCH", prefix + "/git/refs/heads/" + install.BRANCH, {"sha": new, "force": False})
-    if install.read_ref(api, prefix, install.BRANCH) != new:
-        raise ValueError("Handoff ref changed; inspect before retry")
+    install.wait_ref(api, prefix, install.BRANCH, new, old)
     return {"status": "saved", "installed_sha": new}
 
 def main():
@@ -308,6 +363,7 @@ def main():
     c.add_argument("--acceptance", action="append", default=[])
     c.add_argument("--note", required=True)
     c.add_argument("--owner-approved", action="store_true")
+    c.add_argument("--resume-prior-line", action="store_true", help="Resume an eligible unresolved historical checkpoint without renumbering")
     a = sub.add_parser("advance")
     a.add_argument("--note", required=True)
     a.add_argument("--fix")
@@ -339,7 +395,8 @@ def main():
             if args.command in ("claim", "finish", "reconcile") and not args.owner_approved:
                 raise ValueError("Explicit owner approval is required")
             if args.command == "claim":
-                ledger, handoff = claim(api, state, args.issue, args.acceptance, args.note)
+                ledger, handoff = claim(api, state, args.issue, args.acceptance, args.note,
+                    resume_prior_line=args.resume_prior_line)
             elif args.command == "advance":
                 ledger, handoff = advance(api, state, args.note, fix=args.fix, candidate=args.candidate,
                     pr=args.pr, evidence=args.evidence, rework=args.rework, return_to_head=args.return_to_head)
