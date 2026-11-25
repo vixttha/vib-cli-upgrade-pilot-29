@@ -1,0 +1,26 @@
+{
+  "baseline_version": "v0.0.0",
+  "enforcement": "disabled",
+  "install_branch": "Version-Issues-Hub",
+  "package": "Version-Issues-Hub",
+  "package_files_sha256": {
+    "AGENTS.md": "4b71156a42c1d0536cecd1fc3236b1e3f12f3db10d47e18ef6862a47ed2c4cf7",
+    "GATE.md": "e979cdec5c06e979a6de61eb247ac54e17193d6c5698413fbccfea5a4c64ed2b",
+    "README.md": "880f58e320c10f8978a9e32906c3646bd4e82b405fa6133b2698467c02e6b600",
+    "STANDARD.md": "5cf7c1c331718d1e0256c1c18fab29e784cc23832c189b2c610fda57f22e7d30",
+    "WORKFLOW.md": "c0bdf04d68cffb641d7bbe16589717eab72a71dd357b361f681ea85be543da80",
+    "tools/checkpoint.py": "f444c18b83191edc7bd8a07b9b0852699467a169416443a6ca72c3022b426a25",
+    "tools/gate.py": "dba66f94529c5d5ff0e0dea03516a12faecbb12e3a69efbc637a545c5293792e",
+    "tools/install.py": "dc8d5eda99828ece3f432161226acfbcce83ecd5114bd33058b8369687d20f06",
+    "tools/session.py": "ca9c90f469e0c4ef6065beb7ffb842ac3d932dc1f3095f8e9e103de225e7c58a",
+    "tools/standard.py": "1317ce33722205ebc3bdbf83c581680b7d18fa62ddcaf590eb29a9d7ae92d001"
+  },
+  "product_baseline_sha": "d013d61b48d1dd1ccba82b1d0e9346660dd7e1ca",
+  "product_branch": "main",
+  "schema_version": 1,
+  "source_repository": "vixttha/Version-Issues-Hub",
+  "source_sha": "c79217ea4c18d892cd49112bc30b7b28a2fb502b",
+  "target_repository": "vixttha/vib-cli-upgrade-pilot-29",
+  "target_repository_id": 1472437705,
+  "target_version": "v0.0.1"
+}
